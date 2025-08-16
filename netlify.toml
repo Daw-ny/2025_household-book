@@ -1,6 +1,6 @@
 [build]
-  publish = "dist" # 또는 build 결과 폴더
   command = "npm run build"
+  publish = "build"   # ✅ CRA는 build
 
 [[redirects]]
   from = "/*"
