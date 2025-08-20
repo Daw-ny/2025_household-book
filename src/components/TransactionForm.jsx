@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
-// 환경변수에서 URL과 키를 가져옵니다.
+// 환경변수
 const GOOGLE_SCRIPT_URL = process.env.REACT_APP_GOOGLE_SCRIPT_URL;
 const API_KEY = process.env.REACT_APP_GOOGLE_API_KEY;
 
@@ -13,72 +13,151 @@ export default function TransactionForm() {
     return local.toISOString().slice(0, 16); // yyyy-MM-ddTHH:mm
   };
 
-  // 초기 폼 값 정의
-  const defaultForm = {
+  // 초기 폼 값
+  const defaultForm = useMemo(() => ({
     date: getLocalDateTimeString(),
-    type: '지출',
+    type: '지출',           // '지출' | '수입' | '이체'(선택)
     item: '',
     amount: '',
     mainCategory: '',
     subCategory: '',
+    // 드롭다운 선택 결과(백엔드에서 PaymentMethod로 기록)
+    selectedValue: '',      // 실제 값
+    selectedKind: '',       // 'payment' | 'account'
+    // 레거시 입력(텍스트 인풋): 드롭다운과 병행 사용 가능
     payment: '',
     memo: ''
-  };
+  }), []);
 
   const [form, setForm] = useState(defaultForm);
+  const [loading, setLoading] = useState(false); // 중복 클릭 방지
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const [paymentOptionGroups, setPaymentOptionGroups] = useState([]); // [{label, kind, options:[{label,value}]}]
 
-  // 등록 버튼 클릭 시 호출
+  // 공통: GAS 호출 헬퍼
+  const postToGAS = async (action, body) => {
+    const payload = {
+      action,
+      body: { ...body, apiKey: API_KEY }, // 바디에 apiKey 포함 (현재 백엔드 방식)
+    };
+    const res = await fetch(GOOGLE_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error('Invalid server response');
+    }
+  };
+
+  // 폼 오픈 시: PaymentMethod + AccountName 옵션 불러오기
+  useEffect(() => {
+    if (!GOOGLE_SCRIPT_URL || !API_KEY) return;
+
+    const loadOptions = async () => {
+      setOptionsLoading(true);
+      try {
+        const result = await postToGAS('meta.paymentOptions.list', {});
+        const groups = (result.data && result.data.groups) || result.groups || [];
+        setPaymentOptionGroups(groups);
+      } catch (e) {
+        console.error(e);
+        // 실패해도 폼은 사용 가능(텍스트 입력으로 대체)
+      } finally {
+        setOptionsLoading(false);
+      }
+    };
+    loadOptions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [GOOGLE_SCRIPT_URL, API_KEY]);
+
+  // 등록
   const handleSubmit = async () => {
+    if (loading) return;
+
+    // 기본 검증
     if (!form.date || !form.type || !form.item || !form.amount) {
-      alert("날짜, 항목, 금액, 수입/지출을 모두 입력해주세요.");
+      alert('날짜, 항목, 금액, 수입/지출을 모두 입력해주세요.');
       return;
     }
-
     if (!GOOGLE_SCRIPT_URL || !API_KEY) {
-      alert("환경변수가 누락되었습니다. .env 설정을 확인하세요.");
+      alert('환경변수가 누락되었습니다. .env 설정을 확인하세요.');
       return;
     }
 
-    const formWithTargetAndKey = {
-      ...form,
-      targetSheet: 'Transactions',
-      apiKey: API_KEY
+    // 금액 숫자 변환(백엔드 스키마가 number 요구)
+    const amountNumber = Number(form.amount);
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      alert('금액을 올바른 숫자로 입력해주세요.');
+      return;
+    }
+
+    // 요청 ID (멱등성)
+    const requestId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+
+    // 백엔드가 사용하는 키 형태로 매핑 (normalize가 있으니 최소만 맞춰도 됨)
+    const payload = {
+      date: form.date,
+      type: form.type, // '지출' | '수입' | '이체'
+      item: form.item,
+      amount: amountNumber,
+      mainCategory: form.mainCategory || '',
+      subCategory: form.subCategory || '',
+      // 드롭다운 선택 결과를 보냄 (백엔드에서 PaymentMethod로 기록)
+      selectedValue: form.selectedValue || '',
+      selectedKind: form.selectedKind || '',
+      // 레거시 텍스트 입력도 함께 전송(있다면 우선순위는 selectedValue가 높게 백엔드에서 처리)
+      payment: form.payment || '',
+      memo: form.memo || '',
+      requestId
     };
 
+    setLoading(true);
     try {
-      const response = await fetch(GOOGLE_SCRIPT_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/plain;charset=utf-8"
-        },
-        body: JSON.stringify(formWithTargetAndKey)
-      });
+      const result = await postToGAS('sheet.transactions.create', payload);
 
-      const text = await response.text();         // 👈 HTML 응답으로 받음
-      const result = JSON.parse(text);            // 👈 수동으로 JSON 파싱
-
-      if (result.status === "success") {
-        alert("등록이 완료되었습니다.");
+      if (result.status === 'ok' || result.status === 'success') {
+        alert('등록이 완료되었습니다.');
         setForm(defaultForm);
-      } else if (result.status === "unauthorized") {
-        alert("접근이 거부되었습니다. API 키를 확인하세요.");
+      } else if (result.skipped === 'duplicate_requestId' || result.skipped === 'duplicate_content') {
+        alert('중복 요청으로 건너뛰었습니다.');
+        setForm(defaultForm);
+      } else if (result.status === 'unauthorized') {
+        alert('접근이 거부되었습니다. API 키를 확인하세요.');
       } else {
-        alert("오류 발생: " + result.status);
+        alert('오류 발생: ' + (result.message || result.status || 'unknown'));
       }
     } catch (error) {
-      alert("서버 오류: " + error.message);
+      alert('서버 오류: ' + error.message);
+    } finally {
+      setLoading(false);
     }
   };
 
-
   // 초기화
-  const handleReset = () => {
-    setForm(defaultForm);
-  };
+  const handleReset = () => setForm(defaultForm);
 
   // 닫기
-  const handleClose = () => {
-    window.close();
+  const handleClose = () => window.close();
+
+  // 드롭다운 onChange
+  const handlePaymentSelect = (value) => {
+    if (!value) {
+      setForm(f => ({ ...f, selectedValue: '', selectedKind: '' }));
+      return;
+    }
+    // 그룹에서 kind 찾아 저장
+    let foundKind = '';
+    for (const g of paymentOptionGroups) {
+      if (g.options?.some(o => o.value === value)) {
+        foundKind = g.kind; // 'payment' | 'account'
+        break;
+      }
+    }
+    setForm(f => ({ ...f, selectedValue: value, selectedKind: foundKind }));
   };
 
   return (
@@ -110,6 +189,7 @@ export default function TransactionForm() {
       >
         <option value="지출">지출</option>
         <option value="수입">수입</option>
+        <option value="이체">이체</option>{/* 필요 없으면 제거 */}
       </select>
 
       <label>항목 *</label>
@@ -145,10 +225,29 @@ export default function TransactionForm() {
         onChange={e => setForm({ ...form, subCategory: e.target.value })}
       />
 
-      <label>결제 수단</label>
+      {/* 통합 드롭다운 */}
+      <label>결제/계좌 (드롭다운)</label>
+      <select
+        style={inputStyle}
+        value={form.selectedValue}
+        onChange={(e) => handlePaymentSelect(e.target.value)}
+        disabled={optionsLoading}
+      >
+        <option value="">{optionsLoading ? '로딩 중...' : '-- 선택 --'}</option>
+        {paymentOptionGroups.map(group => (
+          <optgroup key={group.label} label={group.label}>
+            {group.options?.map(opt => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+
+      {/* 레거시 직접입력(선택) — 드롭다운 대신 직접 텍스트로 쓰고 싶을 때 사용 */}
+      <label>결제 수단(직접 입력)</label>
       <input
         style={inputStyle}
-        placeholder="결제 수단"
+        placeholder="예: 국민카드, 토스뱅크 등"
         value={form.payment}
         onChange={e => setForm({ ...form, payment: e.target.value })}
       />
@@ -162,15 +261,17 @@ export default function TransactionForm() {
       />
 
       <div style={buttonGroupStyle}>
-        <button type="submit" style={buttonStyle}>등록</button>
-        <button type="button" style={secondaryButtonStyle} onClick={handleReset}>초기화</button>
-        <button type="button" style={secondaryButtonStyle} onClick={handleClose}>닫기</button>
+        <button type="submit" style={{...buttonStyle, opacity: loading ? 0.7 : 1}} disabled={loading}>
+          {loading ? '등록 중…' : '등록'}
+        </button>
+        <button type="button" style={secondaryButtonStyle} onClick={handleReset} disabled={loading}>초기화</button>
+        <button type="button" style={secondaryButtonStyle} onClick={handleClose} disabled={loading}>닫기</button>
       </div>
     </form>
   );
 }
 
-// --- 스타일 정의 ---
+// --- 스타일 ---
 const formStyle = {
   display: 'flex',
   flexDirection: 'column',

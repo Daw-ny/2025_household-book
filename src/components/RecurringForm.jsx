@@ -1,41 +1,96 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
 const GOOGLE_SCRIPT_URL = process.env.REACT_APP_GOOGLE_SCRIPT_URL;
 const API_KEY = process.env.REACT_APP_GOOGLE_API_KEY;
 
 export default function RecurringForm() {
-  // 초기 폼 값 (repeatTime은 입력받지 않음)
-  const defaultForm = {
+  const defaultForm = useMemo(() => ({
     name: '',
-    type: '지출',
+    type: '지출',          // '지출' | '수입' | 필요 시 '이체' 추가 가능
     amount: '',
     mainCategory: '',
     subCategory: '',
+    // 드롭다운에서 선택된 값(결제수단/계좌 공통)
+    selectedValue: '',      // 실제 값
+    selectedKind: '',       // 'payment' | 'account'
+    // 레거시 텍스트 입력(선택)
     paymentMethod: '',
     dayOfMonth: '',
     startMonth: '',
     endMonth: '',
     memo: ''
-  };
+  }), []);
 
   const [form, setForm] = useState(defaultForm);
+  const [loading, setLoading] = useState(false);
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const [paymentOptionGroups, setPaymentOptionGroups] = useState([]); // [{label, kind, options:[{label,value}]}]
 
-  // YYYY-MM 문자열 두 개의 포함 개월 수 계산 (예: 2025-08 ~ 2026-01 -> 6)
+  // 포함 개월 수 계산 (예: 2025-08 ~ 2026-01 -> 6)
   const monthsDiffInclusive = (startYYYYMM, endYYYYMM) => {
     const [sy, sm] = startYYYYMM.split('-').map(Number);
     const [ey, em] = endYYYYMM.split('-').map(Number);
     return (ey - sy) * 12 + (em - sm) + 1;
   };
 
+  // Apps Script 호출 헬퍼 (액션 라우팅)
+  const postToGAS = async (action, body) => {
+    const payload = { action, body: { ...body, apiKey: API_KEY } };
+    const res = await fetch(GOOGLE_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error('Invalid server response');
+    }
+  };
+
+  // 폼 열릴 때 결제수단/계좌 옵션 불러오기
+  useEffect(() => {
+    if (!GOOGLE_SCRIPT_URL || !API_KEY) return;
+    const loadOptions = async () => {
+      setOptionsLoading(true);
+      try {
+        const result = await postToGAS('meta.paymentOptions.list', {});
+        const groups = (result.data && result.data.groups) || result.groups || [];
+        setPaymentOptionGroups(groups);
+      } catch (e) {
+        console.error(e);
+        // 실패해도 텍스트 입력으로 대체 가능
+      } finally {
+        setOptionsLoading(false);
+      }
+    };
+    loadOptions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [GOOGLE_SCRIPT_URL, API_KEY]);
+
   const handleSubmit = async () => {
+    if (loading) return;
+
     // 필수값 검증
     if (!form.name || !form.amount || !form.dayOfMonth || !form.startMonth) {
       alert('필수 항목을 모두 입력해주세요.');
       return;
     }
-
     if (!GOOGLE_SCRIPT_URL || !API_KEY) {
       alert('환경변수가 누락되었습니다. .env 설정을 확인하세요.');
+      return;
+    }
+
+    // 금액/일자 숫자 변환
+    const amountNumber = Number(form.amount);
+    const dayNumber = Number(form.dayOfMonth);
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      alert('금액을 올바른 숫자로 입력해주세요.');
+      return;
+    }
+    if (!Number.isInteger(dayNumber) || dayNumber <= 0 || dayNumber > 31) {
+      alert('매월 며칠은 1~31 사이의 정수여야 합니다.');
       return;
     }
 
@@ -52,39 +107,69 @@ export default function RecurringForm() {
       computedRepeatTime = String(monthsDiffInclusive(form.startMonth, form.endMonth));
     }
 
+    // 요청 ID 생성(멱등성)
+    const requestId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+
+    // 백엔드가 키 정규화하므로, 핵심 키만 맞춰서 전송
     const payload = {
-      ...form,
-      targetSheet: 'Recurring',
-      apiKey: API_KEY,
-      repeatTime: computedRepeatTime // 종료월이 없으면 ''(무기한)
+      name: form.name,
+      type: form.type, // '지출' | '수입' | (선택) '이체'
+      amount: amountNumber,
+      mainCategory: form.mainCategory || '',
+      subCategory: form.subCategory || '',
+      // 드롭다운 선택 결과
+      selectedValue: form.selectedValue || '',
+      selectedKind: form.selectedKind || '',
+      // 레거시 텍스트 입력도 함께 보냄(우선순위는 selectedValue가 높음)
+      payment: form.paymentMethod || '',
+      dayOfMonth: dayNumber,
+      startMonth: form.startMonth,
+      endMonth: form.endMonth || '',
+      repeatTime: computedRepeatTime,   // 종료월 없으면 ''(무기한)
+      memo: form.memo || '',
+      requestId
     };
 
+    setLoading(true);
     try {
-      const response = await fetch(GOOGLE_SCRIPT_URL, {
-        method: 'POST',
-        // preflight(OPTIONS) 방지: simple request 헤더
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload)
-      });
+      const result = await postToGAS('sheet.recurring.create', payload);
 
-      const text = await response.text(); // Apps Script가 text로 응답하는 경우 대비
-      const result = JSON.parse(text);
-
-      if (result.status === 'success') {
+      if (result.status === 'ok' || result.status === 'success') {
         alert('등록이 완료되었습니다.');
+        setForm(defaultForm);
+      } else if (result.skipped === 'duplicate_requestId' || result.skipped === 'duplicate_content') {
+        alert('중복 요청으로 건너뛰었습니다.');
         setForm(defaultForm);
       } else if (result.status === 'unauthorized') {
         alert('접근이 거부되었습니다. API 키를 확인하세요.');
       } else {
-        alert('오류 발생: ' + (result.message || result.status));
+        alert('오류 발생: ' + (result.message || result.status || 'unknown'));
       }
     } catch (error) {
       alert('서버 오류: ' + error.message);
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleReset = () => setForm(defaultForm);
   const handleClose = () => window.close();
+
+  // 드롭다운 onChange
+  const handlePaymentSelect = (value) => {
+    if (!value) {
+      setForm(f => ({ ...f, selectedValue: '', selectedKind: '' }));
+      return;
+    }
+    let foundKind = '';
+    for (const g of paymentOptionGroups) {
+      if (g.options?.some(o => o.value === value)) {
+        foundKind = g.kind; // 'payment' | 'account'
+        break;
+      }
+    }
+    setForm(f => ({ ...f, selectedValue: value, selectedKind: foundKind }));
+  };
 
   return (
     <form
@@ -102,7 +187,7 @@ export default function RecurringForm() {
       <label>항목 이름 *</label>
       <input
         style={inputStyle}
-        placeholder="예: 월세, 급여"
+        placeholder="예: 월세, 헬스장, 급여"
         value={form.name}
         onChange={(e) => setForm({ ...form, name: e.target.value })}
       />
@@ -115,6 +200,7 @@ export default function RecurringForm() {
       >
         <option value="지출">지출</option>
         <option value="수입">수입</option>
+        {/* <option value="이체">이체</option> 필요 시 활성화 */}
       </select>
 
       <label>금액 *</label>
@@ -142,10 +228,29 @@ export default function RecurringForm() {
         onChange={(e) => setForm({ ...form, subCategory: e.target.value })}
       />
 
-      <label>결제 수단</label>
+      {/* 통합 드롭다운: 결제수단 + 계좌 */}
+      <label>결제/계좌 (드롭다운)</label>
+      <select
+        style={inputStyle}
+        value={form.selectedValue}
+        onChange={(e) => handlePaymentSelect(e.target.value)}
+        disabled={optionsLoading}
+      >
+        <option value="">{optionsLoading ? '로딩 중...' : '-- 선택 --'}</option>
+        {paymentOptionGroups.map(group => (
+          <optgroup key={group.label} label={group.label}>
+            {group.options?.map(opt => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+
+      {/* 레거시 직접 입력(선택) */}
+      <label>결제 수단(직접 입력)</label>
       <input
         style={inputStyle}
-        placeholder="카드, 계좌 등"
+        placeholder="예: 국민카드, 토스뱅크 등"
         value={form.paymentMethod}
         onChange={(e) => setForm({ ...form, paymentMethod: e.target.value })}
       />
@@ -176,8 +281,7 @@ export default function RecurringForm() {
       />
 
       <small style={{ fontSize: '12px', color: '#666' }}>
-        종료 월을 지정하면 시작~종료 월(포함)의 개월 수를 자동 계산해 저장합니다.
-        종료 월을 비워두면 무기한 반복으로 저장됩니다.
+        종료 월을 지정하면 시작~종료 월(포함)의 개월 수를 자동 계산해 저장합니다. 비워두면 무기한 반복으로 저장됩니다.
       </small>
 
       <label>메모</label>
@@ -189,15 +293,17 @@ export default function RecurringForm() {
       />
 
       <div style={buttonGroupStyle}>
-        <button type="submit" style={buttonStyle}>등록</button>
-        <button type="button" style={secondaryButtonStyle} onClick={handleReset}>초기화</button>
-        <button type="button" style={secondaryButtonStyle} onClick={handleClose}>닫기</button>
+        <button type="submit" style={{...buttonStyle, opacity: loading ? 0.7 : 1}} disabled={loading}>
+          {loading ? '등록 중…' : '등록'}
+        </button>
+        <button type="button" style={secondaryButtonStyle} onClick={handleReset} disabled={loading}>초기화</button>
+        <button type="button" style={secondaryButtonStyle} onClick={handleClose} disabled={loading}>닫기</button>
       </div>
     </form>
   );
 }
 
-// --- 스타일 정의 ---
+// --- 스타일 ---
 const formStyle = {
   display: 'flex',
   flexDirection: 'column',
