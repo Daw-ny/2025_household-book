@@ -36,20 +36,23 @@ export default function TransactionForm() {
 
   // 공통: GAS 호출 헬퍼
   const postToGAS = async (action, body) => {
+    if (!GOOGLE_SCRIPT_URL || !API_KEY) {
+      throw new Error("환경변수(REACT_APP_GOOGLE_SCRIPT_URL / REACT_APP_GOOGLE_API_KEY)가 비어 있습니다.");
+    }
     const payload = {
       action,
       body: { ...body, apiKey: API_KEY }, // 바디에 apiKey 포함 (현재 백엔드 방식)
     };
     const res = await fetch(GOOGLE_SCRIPT_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // preflight 회피
       body: JSON.stringify(payload),
     });
     const text = await res.text();
     try {
       return JSON.parse(text);
     } catch (e) {
-      throw new Error('Invalid server response');
+      throw new Error('Invalid server response: ' + text);
     }
   };
 
@@ -60,8 +63,11 @@ export default function TransactionForm() {
     const loadOptions = async () => {
       setOptionsLoading(true);
       try {
-        const result = await postToGAS('meta.paymentOptions.list', {});
+        // ✅ 테스트 편의: 캐시 우회
+        const result = await postToGAS('meta.paymentOptions.list', { nocache: true });
         const groups = (result.data && result.data.groups) || result.groups || [];
+        // 디버그 확인이 필요하면 주석 해제
+        // console.log('[meta] groups:', groups);
         setPaymentOptionGroups(groups);
       } catch (e) {
         console.error(e);
@@ -121,10 +127,11 @@ export default function TransactionForm() {
 
       if (result.status === 'ok' || result.status === 'success') {
         alert('등록이 완료되었습니다.');
-        setForm(defaultForm);
+        // ✅ 리셋 시점에 현재 시간으로 갱신
+        setForm({ ...defaultForm, date: getLocalDateTimeString() });
       } else if (result.skipped === 'duplicate_requestId' || result.skipped === 'duplicate_content') {
         alert('중복 요청으로 건너뛰었습니다.');
-        setForm(defaultForm);
+        setForm({ ...defaultForm, date: getLocalDateTimeString() });
       } else if (result.status === 'unauthorized') {
         alert('접근이 거부되었습니다. API 키를 확인하세요.');
       } else {
@@ -138,7 +145,7 @@ export default function TransactionForm() {
   };
 
   // 초기화
-  const handleReset = () => setForm(defaultForm);
+  const handleReset = () => setForm({ ...defaultForm, date: getLocalDateTimeString() });
 
   // 닫기
   const handleClose = () => window.close();

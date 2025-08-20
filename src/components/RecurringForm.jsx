@@ -6,7 +6,7 @@ const API_KEY = process.env.REACT_APP_GOOGLE_API_KEY;
 export default function RecurringForm() {
   const defaultForm = useMemo(() => ({
     name: '',
-    type: '지출',          // '지출' | '수입' | 필요 시 '이체' 추가 가능
+    type: '지출',          // '지출' | '수입'
     amount: '',
     mainCategory: '',
     subCategory: '',
@@ -33,8 +33,11 @@ export default function RecurringForm() {
     return (ey - sy) * 12 + (em - sm) + 1;
   };
 
-  // Apps Script 호출 헬퍼 (액션 라우팅)
+  // Apps Script 호출 헬퍼
   const postToGAS = async (action, body) => {
+    if (!GOOGLE_SCRIPT_URL || !API_KEY) {
+      throw new Error("환경변수(REACT_APP_GOOGLE_SCRIPT_URL / REACT_APP_GOOGLE_API_KEY)가 비어 있습니다.");
+    }
     const payload = { action, body: { ...body, apiKey: API_KEY } };
     const res = await fetch(GOOGLE_SCRIPT_URL, {
       method: 'POST',
@@ -45,7 +48,7 @@ export default function RecurringForm() {
     try {
       return JSON.parse(text);
     } catch {
-      throw new Error('Invalid server response');
+      throw new Error('Invalid server response: ' + text);
     }
   };
 
@@ -55,8 +58,10 @@ export default function RecurringForm() {
     const loadOptions = async () => {
       setOptionsLoading(true);
       try {
-        const result = await postToGAS('meta.paymentOptions.list', {});
+        // ✅ 테스트 편의: 캐시 우회
+        const result = await postToGAS('meta.paymentOptions.list', { nocache: true });
         const groups = (result.data && result.data.groups) || result.groups || [];
+        // console.log('[meta] groups:', groups);
         setPaymentOptionGroups(groups);
       } catch (e) {
         console.error(e);
@@ -113,7 +118,7 @@ export default function RecurringForm() {
     // 백엔드가 키 정규화하므로, 핵심 키만 맞춰서 전송
     const payload = {
       name: form.name,
-      type: form.type, // '지출' | '수입' | (선택) '이체'
+      type: form.type, // '지출' | '수입'
       amount: amountNumber,
       mainCategory: form.mainCategory || '',
       subCategory: form.subCategory || '',
@@ -200,7 +205,6 @@ export default function RecurringForm() {
       >
         <option value="지출">지출</option>
         <option value="수입">수입</option>
-        {/* <option value="이체">이체</option> 필요 시 활성화 */}
       </select>
 
       <label>금액 *</label>
